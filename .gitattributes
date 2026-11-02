@@ -1,0 +1,3 @@
+# Signing scripts are LF-only so bash works on Windows, Linux and Termux.
+android/scripts/*.sh text eol=lf
+android/scripts/tests/*.sh text eol=lf

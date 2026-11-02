@@ -94,33 +94,79 @@ copy of the `.jks`.
 No computer needed. Termux is a terminal for Android (install it from F-Droid, not the
 Play Store build).
 
-```bash
-pkg update && pkg install openjdk-17 gh -y
+Install Git, a JDK and the GitHub CLI once:
 
+```bash
+pkg update && pkg install git openjdk-17 gh -y
+```
+
+Get the intended repository and open it (signing secrets belong to **hakosworld-blip/melo**,
+not to a fork):
+
+```bash
+git clone https://github.com/hakosworld-blip/melo.git
+cd melo
+```
+
+If melo has already been released, **restore the original `melo-release.jks` from your
+backup** instead of creating a new key. Termux can read shared storage after
+`termux-setup-storage`, for example:
+
+```bash
+termux-setup-storage
+cp ~/storage/downloads/melo-release.jks ~/melo-release.jks
+```
+
+Create the key only if you have never published a release:
+
+```bash
 keytool -genkeypair -v \
-  -keystore melo-release.jks \
+  -keystore ~/melo-release.jks \
   -alias melo \
   -keyalg RSA -keysize 4096 -validity 10000 \
   -dname "CN=melo, O=melo, C=US"
-
-# Verify, then encode without line wrapping
-keytool -list -keystore melo-release.jks -alias melo
-base64 -w0 melo-release.jks > melo-release.jks.b64
 ```
 
-Upload the secrets straight from the phone so the values never pass through a clipboard
-or another app:
+**Never create a second key to "fix" an upload problem.** Android only installs an
+update signed by the same key, so keep the existing `melo-release.jks` and repair the
+secret instead.
+
+Authenticate `gh` once, then verify the existing key and upload all four secrets:
 
 ```bash
-gh auth login                     # choose GitHub.com, HTTPS, browser
-gh secret set ANDROID_KEYSTORE_BASE64   < melo-release.jks.b64
-gh secret set ANDROID_KEYSTORE_PASSWORD # paste when prompted
-gh secret set ANDROID_KEY_ALIAS         # e.g. melo
-gh secret set ANDROID_KEY_PASSWORD
+gh auth login                     # GitHub.com, HTTPS, browser
+bash android/scripts/setup-termux-signing.sh --keystore ~/melo-release.jks
 ```
 
-Copy `melo-release.jks` to a second location (SD card, cloud drive) — Termux home
-directories are wiped when the app is reinstalled.
+The helper shows the resolved `owner/name` and asks you to confirm it before uploading
+anything. It refuses to upload from a checkout that resolves to any repository other
+than `hakosworld-blip/melo`. If you are working from a fork, pass
+`--repo hakosworld-blip/melo` (you need permission to set that repository's secrets).
+Only when a different repository is deliberate, add `--allow-non-target-repo` and type
+the repository name when prompted; `--yes` never skips that check. It never generates
+or overwrites a key and never starts a release.
+
+The helper:
+
+- uses the `--keystore` path, then `./melo-release.jks`, then `~/melo-release.jks`;
+- never generates or overwrites a key;
+- verifies the keystore password, alias and private-key access locally;
+- prompts for passwords without echoing them;
+- uploads `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+  `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` through standard input, so no `.b64`
+  copy or plaintext password file is left behind;
+- checks that `gh` is installed and authenticated, and prints the `pkg install gh` /
+  `gh auth login` steps if not;
+- if an upload fails, names the secret that failed, says whether the repository was
+  partially updated, and explains that rerunning the helper is safe;
+- refuses any repository except `hakosworld-blip/melo` unless the target is passed
+  explicitly with `--repo` and `--allow-non-target-repo`, then typed back to confirm;
+- does **not** start a release.
+
+Copy `melo-release.jks` to encrypted storage and keep a second encrypted copy; keep both
+passwords in a password manager. Termux home directories are wiped when the app is
+reinstalled. Losing the key means you cannot publish updates that install over existing
+melo versions.
 
 ### Option C — GitHub Codespaces from a browser
 
@@ -131,12 +177,13 @@ afterwards; do not commit the keystore.
 
 ### Adding the four secrets
 
-GitHub → your repository → **Settings → Secrets and variables → Actions →
+On Termux, prefer `bash android/scripts/setup-termux-signing.sh` (Option B). Otherwise,
+GitHub → `hakosworld-blip/melo` → **Settings → Secrets and variables → Actions →
 New repository secret**:
 
 | Secret name | Value |
 |---|---|
-| `ANDROID_KEYSTORE_BASE64` | entire contents of `melo-release.jks.b64`, one line |
+| `ANDROID_KEYSTORE_BASE64` | Base64 of `melo-release.jks`, one line (no `.b64` file needed) |
 | `ANDROID_KEYSTORE_PASSWORD` | keystore password |
 | `ANDROID_KEY_ALIAS` | `melo` (whatever alias you chose) |
 | `ANDROID_KEY_PASSWORD` | key password |
@@ -158,16 +205,33 @@ These names are fixed; the workflow and the Gradle file both expect them.
 
 The workflow:
 
-1. refuses to run without all four secrets;
-2. sets up JDK 21, the Android SDK (platform 35, build-tools 35.0.0) and Gradle caches;
-3. runs `testDebugUnitTest` and uploads the HTML report;
-4. decodes the keystore into `$RUNNER_TEMP`, `chmod 600`, and deletes it in an
-   `if: always()` step;
-5. builds `assembleRelease` with `MELO_*` variables from the secrets;
-6. verifies with `apksigner` that the APK is signed **and not with a debug key**, and
+1. sets up JDK 21, then runs
+   `android/scripts/android-signing-preflight.sh validate` **before** the Android SDK
+   and unit tests. It checks all four secrets, the Base64 payload, the decoded
+   keystore, the keystore password, the alias and private-key access without building
+   an APK, then always deletes the decoded keystore and never exports its path;
+2. sets up the Android SDK (platform 35, build-tools 35.0.0) and Gradle caches, and
+   runs the unit tests and their report **without any decoded keystore on disk**;
+3. immediately before the build, runs
+   `android/scripts/android-signing-preflight.sh prepare-signing`, which decodes and
+   validates again, keeps the keystore in `$RUNNER_TEMP` with mode `600`, and exports
+   `MELO_KEYSTORE_PATH` for signing only;
+4. builds `assembleRelease` with `MELO_*` variables from the secrets, then immediately
+   deletes the temporary keystore in an `if: always()` step — before verification,
+   artifact upload and release publishing;
+5. verifies with `apksigner` that the APK is signed **and not with a debug key**, and
    with `aapt2` that the package is `app.melo.player` and the version matches;
-7. writes `melo-<version>.apk` plus a `.sha256`, uploads both, and publishes the
+6. writes `melo-<version>.apk` plus a `.sha256`, uploads both, and publishes the
    Release.
+
+Signing preflight failures use stable categories so the cause is obvious in the
+Actions annotation: `missing-secret`, `invalid-base64`, `invalid-keystore`,
+`cannot-open-keystore`, `missing-alias`, `wrong-key-password` and
+`unusable-private-key` (plus `keytool-missing`, `base64-missing`, `tempfile-error` and
+`usage-error` for runner problems). `cannot-open-keystore` covers both possibilities
+because keytool reports the same error for a wrong password and for a corrupted or
+incomplete keystore. Passwords, the Base64 payload, raw keystore data and raw keytool
+output are never printed.
 
 Version code is `github.run_number`, so every build is installable over the previous
 one. Bump the version name by tagging, e.g.:
@@ -283,6 +347,15 @@ against a real in-memory Room database:
 | `TextRulesTest` (7) | title cleaning, key normalisation, similarity, explicit detection |
 | `SpotifyImportTest` (7) | playlist link/id parsing, junk rejection, duplicate-name handling |
 | `LibraryRepositoryTest` (12) | playlist CRUD + ordering, duplicate guard, covers, favourites, history counts, follows, cross-source keys, full wipe |
+
+The signing scripts have their own synthetic tests (no real credentials):
+
+```bash
+bash android/scripts/tests/run.sh
+```
+
+They generate throwaway keystores, mock `gh`, and cover every preflight failure category,
+redaction, unique temporary-file cleanup and isolation between repeated runs.
 
 Not covered by automated tests (needs a device or emulator): actual audio output,
 notification rendering, lock-screen controls, Bluetooth/headset events, process-death

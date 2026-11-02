@@ -47,31 +47,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate signing secrets
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          missing=0
-          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
-            if [ -z "${!name}" ]; then
-              echo "::error title=Missing secret::$name is not set. Add it under Settings -> Secrets and variables -> Actions. See android/README.md."
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "Refusing to publish an unsigned release. Configure the four signing secrets first."
-            exit 1
-          fi
-          echo "All four signing secrets are present."
-
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
+
+      - name: Validate signing secrets and keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash android/scripts/android-signing-preflight.sh validate
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
@@ -136,22 +124,13 @@ jobs:
           path: android/app/build/reports/tests/
           if-no-files-found: ignore
 
-      - name: Decode keystore to a temporary file
+      - name: Prepare signing keystore
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KS_PATH="$RUNNER_TEMP/melo-release.jks"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\n\r ' | base64 --decode > "$KS_PATH"
-          if [ ! -s "$KS_PATH" ]; then
-            echo "::error title=Bad keystore::Decoded keystore is empty. Re-encode the .jks file with base64."
-            exit 1
-          fi
-          chmod 600 "$KS_PATH"
-          keytool -list -keystore "$KS_PATH" -storepass "$ANDROID_KEYSTORE_PASSWORD" > /dev/null
-          echo "MELO_KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
-          echo "Keystore decoded and readable."
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash android/scripts/android-signing-preflight.sh prepare-signing
 
       - name: Build signed release APK
         working-directory: android
@@ -174,6 +153,14 @@ jobs:
             exit 1
           fi
           echo "APK size: $(du -h "$APK" | cut -f1)"
+
+      - name: Remove temporary keystore
+        if: always()
+        run: |
+          if [ -n "${MELO_KEYSTORE_PATH:-}" ] && [ -f "$MELO_KEYSTORE_PATH" ]; then
+            rm -f "$MELO_KEYSTORE_PATH"
+            echo "Temporary keystore removed."
+          fi
 
       - name: Verify signature, package id and checksum
         id: verify
@@ -272,14 +259,6 @@ jobs:
           files: |
             android/melo-${{ steps.version.outputs.name }}.apk
             android/melo-${{ steps.version.outputs.name }}.apk.sha256
-
-      - name: Remove temporary keystore
-        if: always()
-        run: |
-          if [ -n "${MELO_KEYSTORE_PATH:-}" ] && [ -f "$MELO_KEYSTORE_PATH" ]; then
-            rm -f "$MELO_KEYSTORE_PATH"
-            echo "Temporary keystore removed."
-          fi
 
       - name: Job summary
         if: always()

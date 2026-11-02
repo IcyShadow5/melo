@@ -1,0 +1,38 @@
+name: Android signing scripts
+
+on:
+  pull_request:
+    paths:
+      - 'android/scripts/**'
+      - '.gitattributes'
+      - '.github/workflows/android-release.yml'
+      - '.github/workflows/android-signing-scripts.yml'
+  push:
+    paths:
+      - 'android/scripts/**'
+      - '.gitattributes'
+      - '.github/workflows/android-release.yml'
+      - '.github/workflows/android-signing-scripts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test signing preflight and Termux setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Run signing script tests
+        run: bash android/scripts/tests/run.sh
