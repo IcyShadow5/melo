@@ -19,6 +19,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -150,7 +151,12 @@ class DownloadManager(
 
     suspend fun delete(trackKey: String) {
         dao.byKey(trackKey)?.let { entry ->
-            if (entry.filePath.isNotBlank()) runCatching { File(entry.filePath).delete() }
+            // Older versions could store the same path for multiple completed tracks.
+            if (entry.filePath.isNotBlank() && dao.completedOnce().none {
+                    it.trackKey != trackKey && it.filePath == entry.filePath
+                }) {
+                runCatching { File(entry.filePath).delete() }
+            }
         }
         dao.delete(trackKey)
         _progress.value = _progress.value - trackKey
@@ -175,13 +181,10 @@ class DownloadManager(
         _progress.value = _progress.value + (key to value)
     }
 
-    private fun fileName(track: Track, url: String): String {
-        val base = "${track.artist} - ${track.title}"
-            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-            .take(96)
-            .ifBlank { track.key.replace(Regex("[^\\w]"), "_") }
+    internal fun fileName(track: Track, url: String): String {
+        val base = MessageDigest.getInstance("SHA-256")
+            .digest(track.key.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
         val ext = when {
             url.contains(".m3u8") -> "m3u8"
             url.contains("mime=audio%2Fmp4") -> "m4a"
