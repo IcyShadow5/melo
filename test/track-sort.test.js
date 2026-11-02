@@ -2,8 +2,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
-const { TRACK_SORT_MODES, sortTracks, backfillAddedAt } = require('../track-sort');
+const { TRACK_SORT_MODES, sortTracks, backfillAddedAt } = require('../src/renderer/track-sort');
 
 function track(id, addedAt) {
   return addedAt === undefined ? { id } : { id, addedAt };
@@ -68,45 +71,31 @@ test('backfill does not mutate the input list', () => {
   assert.strictEqual(list[0].addedAt, undefined);
 });
 
-function detail(id, title, artist, duration) {
-  return { id, title, artist, duration };
+for (const stored of ['title-asc', 'artist-asc', 'duration-asc', 'unknown']) {
+  test(`unsupported stored sort mode ${stored} falls back to manual order`, () => {
+    const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+    const start = source.indexOf('  function getTrackSortMode(kind) {');
+    const end = source.indexOf('  function setTrackSortMode(kind, mode)', start);
+    assert.ok(start >= 0 && end > start);
+    const mode = vm.runInNewContext(`${source.slice(start, end)}\ngetTrackSortMode('favorites')`, {
+      localStorage: { getItem: () => stored },
+      TRACK_SORT_KEYS: { favorites: 'riff_favorites_sort' },
+      TRACK_SORT_MODES
+    });
+    assert.strictEqual(mode, 'manual');
+    const list = [track('b', 1), track('a', 2)];
+    assert.deepStrictEqual(sortTracks(list, mode), list);
+  });
 }
 
-test('title sort is alphabetical and ignores case', () => {
-  const list = [
-    detail('1', 'beta', 'x', 10),
-    detail('2', 'Alpha', 'x', 10),
-    detail('3', 'gamma', 'x', 10)
-  ];
-  assert.deepStrictEqual(sortTracks(list, 'title-asc').map((t) => t.id), ['2', '1', '3']);
-});
-
-test('title sort puts tracks without a title last', () => {
-  const list = [detail('1', '', 'x', 10), detail('2', 'alpha', 'x', 10)];
-  assert.deepStrictEqual(sortTracks(list, 'title-asc').map((t) => t.id), ['2', '1']);
-});
-
-test('artist sort is alphabetical and keeps ties stable', () => {
-  const list = [
-    detail('1', 'a', 'Zed', 10),
-    detail('2', 'b', 'amy', 10),
-    detail('3', 'c', 'amy', 10)
-  ];
-  assert.deepStrictEqual(sortTracks(list, 'artist-asc').map((t) => t.id), ['2', '3', '1']);
-});
-
-test('duration sort runs shortest first and puts unknown lengths last', () => {
-  const list = [
-    detail('1', 'a', 'x', 240),
-    detail('2', 'b', 'x', 0),
-    detail('3', 'c', 'x', 95)
-  ];
-  assert.deepStrictEqual(sortTracks(list, 'duration-asc').map((t) => t.id), ['3', '1', '2']);
-});
-
 test('every declared sort mode is available to the picker', () => {
-  assert.deepStrictEqual(TRACK_SORT_MODES.slice(0, 3), ['manual', 'added-desc', 'added-asc']);
-  assert.ok(TRACK_SORT_MODES.includes('title-asc'));
-  assert.ok(TRACK_SORT_MODES.includes('artist-asc'));
-  assert.ok(TRACK_SORT_MODES.includes('duration-asc'));
+  assert.deepStrictEqual(TRACK_SORT_MODES, ['manual', 'added-desc', 'added-asc']);
+  const html = fs.readFileSync(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  for (const kind of ['favorites', 'playlist']) {
+    const select = html.match(new RegExp(`<select[^>]*id="${kind}-sort"[^>]*>[\\s\\S]*?</select>`));
+    const menu = html.match(new RegExp(`<div[^>]*id="${kind}-sort-menu"[^>]*>[\\s\\S]*?</div>`));
+    assert.ok(select && menu, kind);
+    assert.deepStrictEqual([...select[0].matchAll(/<option value="([^"]+)"/g)].map(m => m[1]), TRACK_SORT_MODES);
+    assert.deepStrictEqual([...menu[0].matchAll(/data-value="([^"]+)"/g)].map(m => m[1]), TRACK_SORT_MODES);
+  }
 });

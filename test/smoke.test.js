@@ -9,7 +9,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { PassThrough } = require('node:stream');
 
-const { startServer, stopServer, getServerToken } = require('../server');
+require('../test-support/server-environment').setupServerEnvironment();
+const { startServer, stopServer, getServerToken } = require('../src/server/server');
 
 function request(port, path, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -83,9 +84,13 @@ test('Spotify login reports callback errors and protects account routes', async 
 });
 
 test('renderer fetch sends the server token to Spotify account routes', async () => {
-  const source = fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
   const renderer = { electronAPI: { serverToken: getServerToken() }, fetch: fetch.bind(globalThis) };
-  vm.runInNewContext(source.slice(0, source.indexOf('})();') + 5), { window: renderer, Headers, URL });
+  const marker = source.indexOf('window.__riffFetchPatched');
+  const start = source.lastIndexOf('(() => {', marker);
+  const end = source.indexOf('})();', marker) + 5;
+  assert.ok(start >= 0 && end > start);
+  vm.runInNewContext(source.slice(start, end), { window: renderer, Headers, URL });
   const port = await startServer(0);
   try {
     for (const route of ['/api/spotify-auth-start?clientId=' + 'a'.repeat(32), '/api/spotify-status', '/api/spotify-library?likes=1', '/api/spotify-logout']) {
@@ -176,7 +181,7 @@ test('Spotify library reports skipped playlists and rejects malformed pages', as
 });
 
 test('renderer requires consent before importing a partial Spotify library', async () => {
-  const source = fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
   const start = source.indexOf('  async function handleSpotifyLoginImport()');
   const end = source.indexOf('  async function handleSpotifyImportAction()', start);
   assert.ok(start > 0 && end > start);
