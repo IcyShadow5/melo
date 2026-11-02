@@ -3,12 +3,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
 const Module = require('node:module');
 const { PassThrough } = require('node:stream');
+const { dir } = require('../test-support/server-environment').setupServerEnvironment();
 
 function get(port, route, token) {
   return new Promise((resolve, reject) => {
@@ -25,14 +25,13 @@ function get(port, route, token) {
 }
 
 test('Spotify login persists securely, refreshes, restores, and rejects partial link imports', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'riff-spotify-'));
-  const oldDataDir = process.env.RIFF_DATA_DIR;
   const oldElectronVersion = process.versions.electron;
   const oldLoad = Module._load;
   const oldRequest = https.request;
   const oldGet = https.get;
   const safeStorage = {
     isEncryptionAvailable: () => true,
+    getSelectedStorageBackend: () => 'test-keyring',
     encryptString: value => Buffer.from(`sealed:${Buffer.from(value).toString('base64')}`),
     decryptString: value => Buffer.from(value.toString().slice(7), 'base64').toString()
   };
@@ -58,7 +57,6 @@ test('Spotify login persists securely, refreshes, restores, and rejects partial 
   };
 
   try {
-    process.env.RIFF_DATA_DIR = dir;
     process.versions.electron = '41';
     Module._load = function (name, parent, isMain) {
       if (name === 'electron') return { safeStorage };
@@ -107,7 +105,7 @@ test('Spotify login persists securely, refreshes, restores, and rejects partial 
       throw new Error(`Unexpected request: ${url}`);
     };
 
-    server = require('../server');
+    server = require('../src/server/server');
     let port = await server.startServer(0);
     const token = server.getServerToken();
     const start = await get(port, `/api/spotify-auth-start?clientId=${'a'.repeat(32)}`, token);
@@ -139,8 +137,8 @@ test('Spotify login persists securely, refreshes, restores, and rejects partial 
     assert.deepStrictEqual(available.data.tracks.map(track => track.title), ['One']);
 
     await server.stopServer();
-    delete require.cache[require.resolve('../server')];
-    server = require('../server');
+    delete require.cache[require.resolve('../src/server/server')];
+    server = require('../src/server/server');
     port = await server.startServer(0);
     const restoredToken = server.getServerToken();
     assert.strictEqual((await get(port, '/api/spotify-status', restoredToken)).data.connected, true);
@@ -167,8 +165,8 @@ test('Spotify login persists securely, refreshes, restores, and rejects partial 
     const againState = new URL(again.data.url).searchParams.get('state');
     assert.strictEqual((await get(port, `/api/spotify-callback?state=${againState}&code=ok`, restoredToken)).status, 200);
     await server.stopServer();
-    delete require.cache[require.resolve('../server')];
-    server = require('../server');
+    delete require.cache[require.resolve('../src/server/server')];
+    server = require('../src/server/server');
     port = await server.startServer(0);
     rejectRefresh = true;
     const expired = await get(port, '/api/spotify-status', server.getServerToken());
@@ -180,10 +178,7 @@ test('Spotify login persists securely, refreshes, restores, and rejects partial 
     https.request = oldRequest;
     https.get = oldGet;
     Module._load = oldLoad;
-    if (oldDataDir === undefined) delete process.env.RIFF_DATA_DIR;
-    else process.env.RIFF_DATA_DIR = oldDataDir;
     if (oldElectronVersion === undefined) delete process.versions.electron;
     else process.versions.electron = oldElectronVersion;
-    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

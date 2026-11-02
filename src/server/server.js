@@ -6753,33 +6753,57 @@ const server = http.createServer(async (req, res) => {
   res.end('Not found');
 });
 
+let serverStartPromise = null;
+
 function startServer(port = PORT) {
+  if (serverStartPromise) return serverStartPromise;
   if (server.listening) {
     const address = server.address();
     return Promise.resolve(address && typeof address === 'object' ? address.port : port);
   }
-  return new Promise((resolve, reject) => {
-    server.listen(port, '127.0.0.1', () => {
-      const p = server.address().port;
-      console.log(`devsize internal server running on http://127.0.0.1:${p}`);
-      require('./tools').updateYtDlpIfManaged().catch(() => {});
-      resolve(p);
-    }).on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        server.listen(0, '127.0.0.1', () => {
-          const p = server.address().port;
-          console.log(`devsize internal server running on fallback port http://127.0.0.1:${p}`);
-          require('./tools').updateYtDlpIfManaged().catch(() => {});
-          resolve(p);
-        });
-      } else {
+  serverStartPromise = new Promise((resolve, reject) => {
+    function listen(selectedPort) {
+      const onListening = () => {
+        server.removeListener('error', onError);
+        const p = server.address().port;
+        console.log(`devsize internal server running on ${selectedPort === port ? '' : 'fallback port '}http://127.0.0.1:${p}`);
+        require('./tools').updateYtDlpIfManaged().catch(() => {});
+        resolve(p);
+      };
+      const onError = (err) => {
+        server.removeListener('listening', onListening);
+        if (err.code === 'EADDRINUSE' && selectedPort !== 0) listen(0);
+        else reject(err);
+      };
+      server.once('error', onError);
+      try {
+        server.listen(selectedPort, '127.0.0.1', onListening);
+      } catch (err) {
+        server.removeListener('error', onError);
+        server.removeListener('listening', onListening);
         reject(err);
       }
+    }
+    listen(port);
+  }).finally(() => { serverStartPromise = null; });
+  return serverStartPromise;
+}
+
+async function stopServer() {
+  // Closing a pending listen can leave its startup promise unresolved.
+  if (serverStartPromise) await serverStartPromise.catch(() => {});
+  for (const client of sseClients) client.end();
+  sseClients.clear();
+  return new Promise((resolve, reject) => {
+    server.close((err) => {
+      if (err && err.code !== 'ERR_SERVER_NOT_RUNNING') reject(err);
+      else resolve();
     });
+    server.closeAllConnections();
   });
 }
 
-module.exports = { startServer, PORT, getServerToken, fetchLyricsDirect, fetchGeniusLyrics, fetchNetEaseWords, parseYrc };
+module.exports = { startServer, stopServer, PORT, getServerToken, fetchLyricsDirect, fetchGeniusLyrics, fetchNetEaseWords, parseYrc };
 
 if (require.main === module) {
   startServer();
