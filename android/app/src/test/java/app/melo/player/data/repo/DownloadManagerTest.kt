@@ -13,6 +13,16 @@ import java.io.File
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.ResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -28,6 +38,8 @@ class DownloadManagerTest {
     private lateinit var dao: FakeDownloadDao
     private lateinit var resolver: StreamResolver
     private lateinit var manager: DownloadManager
+    private lateinit var context: Context
+    private lateinit var settings: SettingsRepository
 
     private val url = "https://example.com/audio?mime=audio%2Fmp4"
 
@@ -35,15 +47,177 @@ class DownloadManagerTest {
 
     @Before
     fun setUp() {
-        val context = object : ContextWrapper(null) {
+        context = object : ContextWrapper(null) {
             override fun getApplicationContext(): Context = this
             override fun getFilesDir(): File = temporaryFolder.root
             override fun getExternalFilesDir(type: String?): File = temporaryFolder.root
         }
         dao = FakeDownloadDao()
-        val settings = SettingsRepository(context)
+        settings = SettingsRepository(context)
         resolver = StreamResolver(dao, settings)
         manager = DownloadManager(context, dao, settings, resolver)
+    }
+
+    @Test
+    fun `HLS streams fail without requesting or writing the manifest`() = runTest {
+        var requests = 0
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            requests++
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(200).message("OK")
+                .body(("#EXTM3U\n" + "# fixture\n".repeat(3000)).toResponseBody("application/vnd.apple.mpegurl".toMediaType()))
+                .build()
+        }.build()
+        val download = DownloadManager(context, dao, settings, resolver,
+            resolveStream = { ResolvedStream.Remote("https://fixture.invalid/manifest", hls = true) },
+            client = client)
+        val track = track("hls")
+
+        finish(download, track)
+
+        assertEquals("FAILED", dao.byKey(track.key)?.status)
+        assertEquals(0, requests)
+        assertTrue(download.errors.value[track.key].orEmpty().contains("HLS"))
+        assertFalse(File(temporaryFolder.root, "downloads").exists())
+    }
+
+    @Test
+    fun `m3u8 URL is rejected even without the provider HLS flag`() = runTest {
+        val client = OkHttpClient.Builder().addInterceptor { throw AssertionError("HLS must not be requested") }.build()
+        val download = DownloadManager(context, dao, settings, resolver,
+            resolveStream = { ResolvedStream.Remote("https://fixture.invalid/list.M3U8?token=1") }, client = client)
+        val track = track("hls-url")
+        finish(download, track)
+        assertEquals("FAILED", dao.byKey(track.key)?.status)
+        assertTrue(download.errors.value[track.key].orEmpty().contains("HLS"))
+    }
+
+    @Test
+    fun `manifest MIME content and redirect URL cannot become completed audio`() = runTest {
+        val legacy = temporaryFolder.newFile("existing.m4a").apply { writeText("keep existing audio") }
+        val manifest = ("#EXTM3U\n" + "# fixture\n".repeat(3000)).toByteArray()
+        val cases = listOf(
+            Triple(ByteArray(20_000), "application/vnd.apple.mpegurl", url),
+            Triple(ByteArray(20_000), "audio/x-mpegurl", url),
+            Triple(manifest, "audio/mp4", url),
+            Triple(ByteArray(20_000), "audio/mp4", "https://fixture.invalid/list.m3u8"),
+        )
+        cases.forEachIndexed { index, (bytes, mime, finalUrl) ->
+            val download = fixtureDownload(ResolvedStream.Remote(url), bytes, mime, finalUrl = finalUrl)
+            val track = track("manifest-$index")
+            finish(download, track)
+            assertEquals("FAILED", dao.byKey(track.key)?.status)
+            assertEquals("", dao.byKey(track.key)?.filePath)
+            assertTrue(download.errors.value[track.key].orEmpty().contains("HLS"))
+        }
+        assertEquals("keep existing audio", legacy.readText())
+        assertTrue(File(temporaryFolder.root, "downloads").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `progressive audio completes with its hashed path and original bytes`() = runTest {
+        val bytes = ByteArray(20_000) { (it % 251).toByte() }
+        val download = fixtureDownload(ResolvedStream.Remote(url), bytes)
+        val track = track("progressive")
+        finish(download, track)
+        val saved = checkNotNull(dao.byKey(track.key))
+        assertEquals("DONE", saved.status)
+        assertEquals(download.fileName(track, url), File(saved.filePath).name)
+        assertTrue(bytes.contentEquals(File(saved.filePath).readBytes()))
+        assertEquals(bytes.size.toLong(), saved.bytes)
+        assertFalse(File(saved.filePath + ".part").exists())
+        assertEquals(ResolvedStream.Local(saved.filePath), resolver.resolve(track))
+    }
+
+    @Test
+    fun `truncated progressive response fails and removes only its partial file`() = runTest {
+        val track = track("truncated")
+        val existing = File(temporaryFolder.root, "downloads").apply { mkdirs() }
+            .resolve(manager.fileName(track, url)).apply { writeText("preserve target") }
+        val download = fixtureDownload(ResolvedStream.Remote(url), ByteArray(20_000), declaredLength = 30_000)
+        finish(download, track)
+        assertEquals("FAILED", dao.byKey(track.key)?.status)
+        assertEquals("", dao.byKey(track.key)?.filePath)
+        assertEquals("preserve target", existing.readText())
+        assertFalse(File(existing.absolutePath + ".part").exists())
+    }
+
+    @Test
+    fun `partial 206 coverage fails without replacing the existing target`() = runTest {
+        val track = track("partial-range")
+        val target = File(temporaryFolder.root, "downloads").apply { mkdirs() }
+            .resolve(manager.fileName(track, url)).apply { writeText("preserve existing audio") }
+        val download = fixtureDownload(ResolvedStream.Remote(url), ByteArray(20_000), status = 206,
+            contentRange = "bytes 0-19999/100000")
+        finish(download, track)
+        assertEquals("FAILED", dao.byKey(track.key)?.status)
+        assertEquals("", dao.byKey(track.key)?.filePath)
+        assertEquals("preserve existing audio", target.readText())
+        assertFalse(File(target.absolutePath + ".part").exists())
+    }
+
+    @Test
+    fun `complete 206 coverage is permitted with known or unknown body length`() = runTest {
+        val bytes = ByteArray(20_000) { (it % 251).toByte() }
+        for (length in listOf(20_000L, -1L)) {
+            val track = track("complete-range-$length")
+            val download = fixtureDownload(ResolvedStream.Remote(url), bytes, declaredLength = length,
+                status = 206, contentRange = "bytes 0-19999/20000")
+            finish(download, track)
+            val saved = checkNotNull(dao.byKey(track.key))
+            assertEquals("DONE", saved.status)
+            assertEquals(20_000L, saved.bytes)
+            assertTrue(bytes.contentEquals(File(saved.filePath).readBytes()))
+        }
+    }
+
+    @Test
+    fun `206 responses require valid full coverage and matching actual bytes`() = runTest {
+        val cases = listOf(
+            null to 20_000L,
+            "bytes 0-19999/*" to 20_000L,
+            "bytes 1-20000/20001" to 20_000L,
+            "bytes 0-19999/20000" to 30_000L,
+            "bytes 0-29999/30000" to -1L,
+            "bytes 0-19999/999999999999999999999" to 20_000L,
+            "bytes 0-19999/0" to 20_000L,
+            "invalid" to 20_000L,
+        )
+        cases.forEachIndexed { index, (range, length) ->
+            val track = track("bad-range-$index")
+            val download = fixtureDownload(ResolvedStream.Remote(url), ByteArray(20_000),
+                declaredLength = length, status = 206, contentRange = range)
+            finish(download, track)
+            assertEquals("FAILED", dao.byKey(track.key)?.status)
+            assertEquals("", dao.byKey(track.key)?.filePath)
+        }
+        assertTrue(File(temporaryFolder.root, "downloads").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `provider failure and HTTP rejection cannot complete a download`() = runTest {
+        val failure = fixtureDownload(ResolvedStream.Failure("Fixture unavailable"), ByteArray(0))
+        val missing = track("missing")
+        finish(failure, missing)
+        assertEquals("FAILED", dao.byKey(missing.key)?.status)
+        assertEquals("Fixture unavailable", failure.errors.value[missing.key])
+
+        val denied = fixtureDownload(ResolvedStream.Remote(url), ByteArray(20_000), status = 403)
+        val forbidden = track("forbidden")
+        finish(denied, forbidden)
+        assertEquals("FAILED", dao.byKey(forbidden.key)?.status)
+        assertEquals("HTTP 403", denied.errors.value[forbidden.key])
+        assertTrue(File(temporaryFolder.root, "downloads").listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `local source resolution preserves existing files and reports missing files`() = runTest {
+        val file = temporaryFolder.newFile("local.m4a").apply { writeText("local audio") }
+        val track = track("local").copy(source = Source.LOCAL, streamUrl = file.absolutePath)
+        assertEquals(ResolvedStream.Local(file.absolutePath), resolver.resolve(track))
+        assertEquals("local audio", file.readText())
+        val missing = track.copy(streamUrl = File(temporaryFolder.root, "missing.m4a").absolutePath)
+        assertEquals(ResolvedStream.Failure("This file is no longer available."), resolver.resolve(missing))
     }
 
     @Test
@@ -172,6 +346,37 @@ class DownloadManagerTest {
 
         assertEquals(null, dao.byKey(second.key))
         assertFalse(file.exists())
+    }
+
+    private suspend fun finish(download: DownloadManager, track: Track) {
+        download.enqueue(track)
+        withContext(Dispatchers.IO) {
+            withTimeout(5000) { while (download.isDownloading(track.key)) delay(5) }
+        }
+        assertFalse(download.isDownloading(track.key))
+    }
+
+    private fun fixtureDownload(
+        stream: ResolvedStream,
+        bytes: ByteArray,
+        mime: String = "audio/mp4",
+        finalUrl: String = url,
+        declaredLength: Long = bytes.size.toLong(),
+        status: Int = 200,
+        contentRange: String? = null,
+    ): DownloadManager {
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val body = bytes.toResponseBody(mime.toMediaType())
+            Response.Builder().request(chain.request().newBuilder().url(finalUrl).build())
+                .protocol(Protocol.HTTP_1_1).code(status).message("Fixture")
+                .apply { contentRange?.let { header("Content-Range", it) } }
+                .body(object : ResponseBody() {
+                    override fun contentType() = body.contentType()
+                    override fun contentLength() = declaredLength
+                    override fun source() = body.source()
+                }).build()
+        }.build()
+        return DownloadManager(context, dao, settings, resolver, resolveStream = { stream }, client = client)
     }
 
     private fun completed(track: Track, file: File) = DownloadEntity(

@@ -11,7 +11,6 @@ import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
@@ -22,12 +21,10 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import app.melo.player.MainActivity
-import app.melo.player.data.model.ResolvedStream
 import app.melo.player.data.remote.Api
 import app.melo.player.di.ServiceLocator
 import kotlinx.coroutines.runBlocking
 import java.io.File
-import java.io.IOException
 
 /**
  * Foreground playback service.
@@ -48,7 +45,19 @@ class MeloPlaybackService : MediaSessionService() {
         super.onCreate()
         ServiceLocator.init(this)
 
-        val mediaSourceFactory = DefaultMediaSourceFactory(buildDataSourceFactory())
+        val router = buildHostRoutingDataSourceFactory()
+        val dataSources = buildCachedDataSourceFactory(router)
+        val resolve = ServiceLocator.resolver::resolve
+        val mediaSourceFactory = TrackMediaSourceFactory(
+            DefaultMediaSourceFactory(dataSources),
+            progressiveFactory = { track ->
+                DefaultMediaSourceFactory(progressiveDataSourceFactory(dataSources, track, resolve))
+            },
+            // Live HLS playlists change behind an unchanged URL, so they must not
+            // reuse the persistent progressive-audio cache.
+            hlsFactory = DefaultMediaSourceFactory(router),
+            resolve = resolve,
+        )
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
                 /* minBufferMs = */ 30_000,
@@ -151,13 +160,25 @@ class MeloPlaybackService : MediaSessionService() {
     }
 
     /**
-     * Cache -> (resolve) -> HTTP/File.
-     *
-     * The resolving layer is what turns a `melo://track/…` media item into a real
-     * stream URL at play time, so the UI never has to hold expiring URLs and the
-     * cached copy is keyed by track rather than by signature.
+     * Host-aware HTTP/File routing shared by cached progressive audio and
+     * uncached HLS playback. Google's CDN and ordinary hosts need different
+     * client identities, and local downloads stay plain files.
      */
-    private fun buildDataSourceFactory(): DataSource.Factory {
+    private fun buildHostRoutingDataSourceFactory(): DataSource.Factory {
+        val googleHttp = OkHttpDataSource.Factory(Api.streamingClient)
+            .setDefaultRequestProperties(mapOf("User-Agent" to Api.ANDROID_VR_UA))
+        val otherHttp = OkHttpDataSource.Factory(Api.streamingClient)
+            .setDefaultRequestProperties(mapOf("User-Agent" to Api.WEB_UA))
+        val fileFactory = DefaultDataSource.Factory(this)
+
+        return HostRoutingDataSource.Factory(googleHttp, otherHttp, fileFactory)
+    }
+
+    /**
+     * Cache -> HTTP/File for progressive audio and local files. HLS deliberately
+     * uses the uncached router so playlist refreshes always reach the provider.
+     */
+    private fun buildCachedDataSourceFactory(router: DataSource.Factory): DataSource.Factory {
         val cacheDir = File(cacheDir, "audio")
         val limitMb = runCatching { runBlocking { ServiceLocator.settings.current().cacheLimitMb } }
             .getOrDefault(512)
@@ -168,37 +189,10 @@ class MeloPlaybackService : MediaSessionService() {
         )
         audioCache = cache
 
-        val googleHttp = OkHttpDataSource.Factory(Api.streamingClient)
-            .setDefaultRequestProperties(mapOf("User-Agent" to Api.ANDROID_VR_UA))
-        val otherHttp = OkHttpDataSource.Factory(Api.streamingClient)
-            .setDefaultRequestProperties(mapOf("User-Agent" to Api.WEB_UA))
-        val fileFactory = DefaultDataSource.Factory(this)
-
-        val router = HostRoutingDataSource.Factory(googleHttp, otherHttp, fileFactory)
-
-        val cacheFactory = CacheDataSource.Factory()
+        return CacheDataSource.Factory()
             .setCache(cache)
             .setUpstreamDataSourceFactory(router)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-
-        val resolver = ResolvingDataSource.Resolver { dataSpec ->
-            val track = TrackCodec.fromUri(dataSpec.uri)
-            if (track == null) {
-                dataSpec
-            } else {
-                when (val resolved = runBlocking { ServiceLocator.resolver.resolve(track) }) {
-                    is ResolvedStream.Remote ->
-                        dataSpec.withUri(android.net.Uri.parse(resolved.url)).buildUpon()
-                            .setKey(track.key).build()
-                    is ResolvedStream.Local ->
-                        dataSpec.withUri(android.net.Uri.fromFile(File(resolved.path))).buildUpon()
-                            .setKey(track.key).build()
-                    is ResolvedStream.Failure ->
-                        throw IOException(resolved.message)
-                }
-            }
-        }
-        return ResolvingDataSource.Factory(cacheFactory, resolver)
     }
 }
 

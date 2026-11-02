@@ -125,7 +125,12 @@ data class HomeSection(
 
 /** Result of resolving a playable URL for [Track]. */
 sealed interface ResolvedStream {
-    data class Remote(val url: String, val hls: Boolean = false) : ResolvedStream
+    data class Remote(val url: String, val hls: Boolean = false) : ResolvedStream {
+        val isHls: Boolean
+            get() = hls || runCatching {
+                java.net.URI(url).path.orEmpty().endsWith(".m3u8", ignoreCase = true)
+            }.getOrDefault(false)
+    }
     data class Local(val path: String) : ResolvedStream
     data class Failure(val message: String) : ResolvedStream
 }

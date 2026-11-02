@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.Request
 import java.io.File
 import java.security.MessageDigest
@@ -34,7 +35,9 @@ class DownloadManager(
     private val context: Context,
     private val dao: DownloadDao,
     private val settings: SettingsRepository,
-    private val resolver: StreamResolver,
+    resolver: StreamResolver,
+    private val resolveStream: suspend (Track) -> ResolvedStream = resolver::resolve,
+    private val client: Call.Factory = Api.streamingClient,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val jobs = ConcurrentHashMap<String, Job>()
@@ -74,60 +77,78 @@ class DownloadManager(
 
     private suspend fun run(track: Track) {
         val key = track.key
-        dao.setStatus(key, "RUNNING")
-        setProgress(key, 0f)
-
-        val resolved = resolver.resolve(track)
-        if (resolved !is ResolvedStream.Remote) {
-            fail(key, (resolved as? ResolvedStream.Local)?.let { "Already available offline." }
-                ?: "Could not resolve this track for download.")
-            return
-        }
-
-        val target = File(dir(), fileName(track, resolved.url))
-        val tmp = File(dir(), target.name + ".part")
-
+        var partial: File? = null
         try {
+            dao.setStatus(key, "RUNNING")
+            setProgress(key, 0f)
+            val resolved = resolveStream(track)
+            if (resolved !is ResolvedStream.Remote) {
+                throw IllegalStateException((resolved as? ResolvedStream.Local)?.let { "Already available offline." }
+                    ?: (resolved as? ResolvedStream.Failure)?.message
+                    ?: "Could not resolve this track for download.")
+            }
+            if (resolved.isHls) throw IllegalStateException(HLS_DOWNLOAD_ERROR)
+
+            val target = File(dir(), fileName(track, resolved.url))
+            val tmp = File(dir(), target.name + ".part")
+            partial = tmp
             withContext(Dispatchers.IO) {
                 val request = Request.Builder()
                     .url(resolved.url)
                     .header("User-Agent", if (resolved.url.contains("googlevideo")) Api.ANDROID_VR_UA else Api.WEB_UA)
                     .build()
 
-                val response = Api.streamingClient.newCall(request).execute()
-                if (!response.isSuccessful) {
-                    response.close()
-                    throw IllegalStateException("HTTP ${response.code}")
-                }
-                val body = response.body ?: throw IllegalStateException("Empty response")
-                val total = body.contentLength().takeIf { it > 0 } ?: -1L
-                var written = 0L
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
+                    val body = response.body ?: throw IllegalStateException("Empty response")
+                    val mime = body.contentType()?.let { "${it.type}/${it.subtype}" }.orEmpty().lowercase()
+                    if (ResolvedStream.Remote(response.request.url.toString()).isHls ||
+                        mime in setOf("application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl") ||
+                        response.peekBody(64).string().removePrefix("\uFEFF").trimStart().startsWith("#EXTM3U")) {
+                        throw IllegalStateException(HLS_DOWNLOAD_ERROR)
+                    }
+                    val total = if (response.code == 206) {
+                        val range = response.headers.values("Content-Range").singleOrNull()
+                            ?.trim()?.let(FULL_CONTENT_RANGE::matchEntire)
+                            ?: throw IllegalStateException("Download response has no valid full Content-Range")
+                        val first = range.groupValues[1].toLongOrNull()
+                        val last = range.groupValues[2].toLongOrNull()
+                        val size = range.groupValues[3].toLongOrNull()
+                        if (first != 0L || size == null || size <= 0 || last != size - 1 ||
+                            (body.contentLength() >= 0 && body.contentLength() != size)) {
+                            throw IllegalStateException("Download response does not contain the complete file")
+                        }
+                        size
+                    } else body.contentLength().takeIf { it > 0 } ?: -1L
+                    var written = 0L
 
-                body.byteStream().use { input ->
-                    tmp.outputStream().use { output ->
-                        val buffer = ByteArray(64 * 1024)
-                        var read: Int
-                        var lastUpdate = 0L
-                        while (input.read(buffer).also { read = it } > 0) {
-                            output.write(buffer, 0, read)
-                            written += read
-                            val now = System.currentTimeMillis()
-                            if (now - lastUpdate > 250) {
-                                lastUpdate = now
-                                setProgress(key, if (total > 0) written.toFloat() / total else 0f)
-                                dao.setBytes(key, written)
+                    body.byteStream().use { input ->
+                        tmp.outputStream().use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var read: Int
+                            var lastUpdate = 0L
+                            while (input.read(buffer).also { read = it } > 0) {
+                                output.write(buffer, 0, read)
+                                written += read
+                                val now = System.currentTimeMillis()
+                                if (now - lastUpdate > 250) {
+                                    lastUpdate = now
+                                    setProgress(key, if (total > 0) written.toFloat() / total else 0f)
+                                    dao.setBytes(key, written)
+                                }
                             }
                         }
                     }
+                    if (total > 0 && written != total) throw IllegalStateException("Download ended before the complete file arrived")
+                    if (tmp.length() < 16 * 1024) throw IllegalStateException("Downloaded file looks invalid")
+                    if (target.exists()) target.delete()
+                    if (!tmp.renameTo(target)) throw IllegalStateException("Could not finalise file")
+                    dao.complete(key, target.absolutePath, target.length())
+                    setProgress(key, 1f)
                 }
-                if (tmp.length() < 16 * 1024) throw IllegalStateException("Downloaded file looks invalid")
-                if (target.exists()) target.delete()
-                if (!tmp.renameTo(target)) throw IllegalStateException("Could not finalise file")
-                dao.complete(key, target.absolutePath, target.length())
-                setProgress(key, 1f)
             }
         } catch (e: Exception) {
-            runCatching { tmp.delete() }
+            runCatching { partial?.delete() }
             fail(key, e.message ?: "Download failed")
         } finally {
             jobs.remove(key)
@@ -192,5 +213,10 @@ class DownloadManager(
             else -> "m4a"
         }
         return "$base.$ext"
+    }
+
+    private companion object {
+        val FULL_CONTENT_RANGE = Regex("bytes ([0-9]+)-([0-9]+)/([0-9]+)", RegexOption.IGNORE_CASE)
+        const val HLS_DOWNLOAD_ERROR = "HLS streams cannot be downloaded for offline playback yet. Streaming is still available."
     }
 }

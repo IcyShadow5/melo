@@ -198,9 +198,9 @@ $ANDROID_HOME/build-tools/35.0.0/aapt2 dump badging melo-1.0.0.apk | head -3
   Media3.
 - Audio focus (`handleAudioFocus = true`) and `setHandleAudioBecomingNoisy(true)` so
   unplugging headphones pauses instead of blasting the speaker.
-- Just-in-time stream resolution through a `ResolvingDataSource`: queue items carry a
-  `melo://track/...` URI, and the real URL is fetched when playback starts. Expiring
-  provider URLs are never stored in the queue.
+- Just-in-time stream resolution through `TrackMediaSourceFactory`: queue items carry
+  a `melo://track/...` URI. Resolution runs off the playback thread before Media3
+  chooses an HLS or progressive source. Expiring provider URLs stay out of the queue.
 - LRU disk cache (`SimpleCache`) sized by the "streaming cache limit" setting.
 - Wake lock, `onTaskRemoved` handling, and `onPlaybackResumption` so system resume
   works after the process is killed.
@@ -317,7 +317,10 @@ recovery, and Compose screenshot behaviour.
 - **Downloads are subject to provider terms.** melo stores the audio stream the provider
   serves to it, exactly as the desktop app's download feature does. Whether that is
   permitted is between you and the provider; nothing here bypasses DRM, paywalls or
-  access controls, and a provider refusal is reported as a failed download.
+  access controls, and a provider refusal is reported as a failed download. HLS is
+  supported for streaming; offline HLS downloads are rejected with an explicit error
+  because storing a manifest alone does not store its audio. Existing completed
+  download paths are preserved.
 - **Not Play Store ready.** The release APK is signed and installable, but Play requires
   a privacy policy, a data-safety declaration and content-rights attestation — none of
   which are done here.
